@@ -1,0 +1,32 @@
+[
+  {
+    "day": 1,
+    "species": 1,
+    "version": "FRLG",
+    "hints": [
+      "Green",
+      "Starter",
+      "Kanto"
+    ]
+  },
+  {
+    "day": 2,
+    "species": 4,
+    "version": "FRLG",
+    "hints": [
+      "Red",
+      "Starter",
+      "Kanto"
+    ]
+  },
+  {
+    "day": 4,
+    "species": 7,
+    "version": "FRLG",
+    "hints": [
+      "Blue",
+      "Starter",
+      "Kanto"
+    ]
+  }
+]
