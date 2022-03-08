@@ -14,12 +14,14 @@ use serenity::model::prelude::application_command::{ApplicationCommand};
 use tokio::time;
 
 use serde::Deserialize;
-use serenity::model::prelude::ChannelId;
+use serenity::http::CacheHttp;
+use serenity::model::id::RoleId;
+use serenity::model::prelude::{ChannelId, InteractionApplicationCommandCallbackDataFlags};
 
 #[derive(Deserialize, Clone)]
 struct ContestDay {
     day: u8,
-    _species: u8,
+    species: u8,
     version: String,
     hints: Vec<String>,
 }
@@ -52,6 +54,8 @@ struct Handler {
     awaiting_details: Arc<Mutex<bool>>,
     register_commands: Arc<Mutex<bool>>,
     contest: Arc<Mutex<Option<Contest>>>,
+    permission_role: u64,
+    contest_channel: u64,
 }
 
 #[async_trait]
@@ -59,84 +63,85 @@ impl EventHandler for Handler {
     async fn message(&self, ctx: Context, message: Message) {
         if !message.attachments.is_empty() {
             let awaiting_details = self.awaiting_details.lock().await;
-            if *awaiting_details {
-                let attachments = message.attachments.get(0).unwrap();
-                let mut contest_guard = self.contest.lock().await;
-                if let Some(t) = attachments.content_type.as_ref() {
-                    if t == "application/json; charset=utf-8" {
-                        if let Ok(data) = attachments.download().await {
-                            if let Ok(details) = serde_json::from_slice(data.as_slice()) {
-                                if let Some(contest) = contest_guard.as_mut() {
-                                    contest.details = details;
-                                    if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
-                                        m.content("Contest details loaded!")
-                                    }).await {
-                                        println!("An error occurred confirming contest details: {:?}", why);
-                                    }
-                                    contest.current_day = Some(0);
+            if *awaiting_details && message.author.has_role(&ctx.http(), message.guild_id.unwrap(), RoleId(self.permission_role)).await.expect("Failed to retrieve role") {
+                    let attachments = message.attachments.get(0).unwrap();
+                    let mut contest_guard = self.contest.lock().await;
+                    if let Some(t) = attachments.content_type.as_ref() {
+                        if t == "application/json; charset=utf-8" {
+                            if let Ok(data) = attachments.download().await {
+                                if let Ok(details) = serde_json::from_slice(data.as_slice()) {
+                                    if let Some(contest) = contest_guard.as_mut() {
+                                        contest.details = details;
+                                        if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
+                                            m.content("Contest details loaded!")
+                                        }).await {
+                                            println!("An error occurred confirming contest details: {:?}", why);
+                                        }
+                                        contest.current_day = Some(0);
 
-                                    let contest_clone = Arc::clone(&self.contest);
-                                    let ctx = Arc::new(ctx);
-                                    let ctx_clone = Arc::clone(&ctx);
-                                    tokio::spawn(async move {
-                                        let contest = contest_clone;
-                                        let ctx = ctx_clone;
-                                        let mut interval = time::interval(Duration::from_secs(30));
-                                        loop {
-                                            interval.tick().await;
-                                            let mut contest = contest.lock().await;
-                                            if let Some(c) = contest.as_mut() {
-                                                if let Some(d) = c.current_day.as_mut() {
-                                                    *d += 1;
-                                                    if let Some(contest_day) = c.details.get_day(*d) {
-                                                        let broadcast = ChannelId(950395373183197234)
-                                                            .send_message(&ctx.http, |m| {
-                                                                m.embed(|e| {
-                                                                    let mut embed = e.title(format!("Day {}", contest_day.day));
-                                                                    embed = embed.field("Version", &contest_day.version, false);
-                                                                    embed = embed.fields(contest_day.hints_to_fields());
-                                                                    embed
-                                                                })
-                                                            }).await;
-                                                        if let Err(why) = broadcast {
-                                                            println!("Error sending message: {:?}", why);
-                                                        }
-                                                    } else if let Some(last_day) = c.details.get_last_day() {
-                                                        if *d > last_day {
-                                                            *contest = None;
-                                                            let broadcast = ChannelId(950395373183197234)
+                                        let contest_clone = Arc::clone(&self.contest);
+                                        let ctx = Arc::new(ctx);
+                                        let ctx_clone = Arc::clone(&ctx);
+                                        let channel_id = self.contest_channel;
+                                        tokio::spawn(async move {
+                                            let contest = contest_clone;
+                                            let ctx = ctx_clone;
+                                            let channel_id = channel_id;
+                                            let mut interval = time::interval(Duration::from_secs(30));
+                                            loop {
+                                                interval.tick().await;
+                                                let mut contest = contest.lock().await;
+                                                if let Some(c) = contest.as_mut() {
+                                                    if let Some(d) = c.current_day.as_mut() {
+                                                        *d += 1;
+                                                        if let Some(contest_day) = c.details.get_day(*d) {
+                                                            let broadcast = ChannelId(channel_id)
                                                                 .send_message(&ctx.http, |m| {
-                                                                    m.content("The current contest has ended!")
+                                                                    m.embed(|e| {
+                                                                        e.title(format!("Day {}", contest_day.day)).field("Version", &contest_day.version, false);
+                                                                        e.fields(contest_day.hints_to_fields())
+                                                                    })
                                                                 }).await;
                                                             if let Err(why) = broadcast {
                                                                 println!("Error sending message: {:?}", why);
                                                             }
-                                                            break;
+                                                        } else if let Some(last_day) = c.details.get_last_day() {
+                                                            if *d > last_day {
+                                                                *contest = None;
+                                                                let broadcast = ChannelId(channel_id)
+                                                                    .send_message(&ctx.http, |m| {
+                                                                        m.content("The current contest has ended!")
+                                                                    }).await;
+                                                                if let Err(why) = broadcast {
+                                                                    println!("Error sending message: {:?}", why);
+                                                                }
+                                                                break;
+                                                            }
                                                         }
                                                     }
+                                                } else {
+                                                    break;
                                                 }
-                                            } else {
-                                                break;
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
+                                } else if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
+                                    m.content("Failed to load contest details. Please restart the process with /contest start")
+                                }).await {
+                                    println!("An error occurred confirming contest details: {:?}", why);
                                 }
-                            } else if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
-                                m.content("Failed to load contest details. Please restart the process with /contest start")
-                            }).await {
-                                println!("An error occurred confirming contest details: {:?}", why);
+                            } else {
+                                if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
+                                    m.content("Failed to download attachment. Please restart the process with /contest start")
+                                }).await {
+                                    println!("An error occurred confirming contest details: {:?}", why);
+                                }
+                                *contest_guard = None;
                             }
-                        } else {
-                            if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
-                                m.content("Failed to download attachment. Please restart the process with /contest start")
-                            }).await {
-                                println!("An error occurred confirming contest details: {:?}", why);
-                            }
-                            *contest_guard = None;
                         }
                     }
                 }
-            }
+
         }
     }
 
@@ -159,7 +164,7 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::ApplicationCommand(command) = interaction {
-            if command.data.name.as_str() == "contest" {
+            if command.data.name.as_str() == "contest" && command.user.has_role(&ctx.http(), command.guild_id.unwrap(), RoleId(self.permission_role)).await.expect("Failed to retrieve role") {
                 let option = command.data.options.get(0).expect("Expected sub command option");
                 if let ApplicationCommandOptionType::SubCommand = option.kind {
                     match option.name.as_str() {
@@ -173,7 +178,7 @@ impl EventHandler for Handler {
                                 if let Err(why) = command
                                     .create_interaction_response(&ctx.http, |r| {
                                         r.kind(InteractionResponseType::ChannelMessageWithSource)
-                                            .interaction_response_data(|m| m.content("Awaiting json with giveaway details."))
+                                            .interaction_response_data(|m| m.flags(InteractionApplicationCommandCallbackDataFlags::EPHEMERAL).content("Awaiting json with giveaway details."))
                                     }).await {
                                     println!("Cannot respond to slash command: {}", why);
                                 }
@@ -189,7 +194,7 @@ impl EventHandler for Handler {
                             if let Err(why) = command
                                 .create_interaction_response(&ctx.http, |r| {
                                     r.kind(InteractionResponseType::ChannelMessageWithSource)
-                                        .interaction_response_data(|m| m.content("The giveaway has been stopped."))
+                                        .interaction_response_data(|m| m.flags(InteractionApplicationCommandCallbackDataFlags::EPHEMERAL).content("The giveaway has been stopped."))
                                 }).await {
                                 println!("Cannot respond to slash command: {}", why);
                             }
@@ -212,11 +217,21 @@ async fn main() {
         .expect("Expected an application id in the environment")
         .parse()
         .expect("application id is not a valid id");
+    let permission_role: u64 = env::var("PERMISSION_ROLE")
+        .expect("Expected an role id in the environment")
+        .parse()
+        .expect("role id is not a valid id");
+    let contest_channel: u64 = env::var("CONTEST_CHANNEL")
+        .expect("Expected an channel id in the environment")
+        .parse()
+        .expect("channel id is not a valid id");
 
     let handler = Handler {
         awaiting_details: Arc::new(Mutex::new(false)),
         register_commands: Arc::new(Mutex::new(register_slash_commands)),
         contest: Arc::new(Mutex::new(Option::None)),
+        permission_role,
+        contest_channel,
     };
 
     let mut client = Client::builder(token)
