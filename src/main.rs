@@ -21,7 +21,7 @@ struct ContestDay {
     day: u8,
     _species: u8,
     version: String,
-    hints: Vec<String>
+    hints: Vec<String>,
 }
 
 impl ContestDay {
@@ -45,13 +45,13 @@ impl ContestDetails {
 
 struct Contest {
     current_day: Option<u8>,
-    details: ContestDetails
+    details: ContestDetails,
 }
 
 struct Handler {
     awaiting_details: Arc<Mutex<bool>>,
     register_commands: Arc<Mutex<bool>>,
-    contest: Arc<Mutex<Option<Contest>>>
+    contest: Arc<Mutex<Option<Contest>>>,
 }
 
 #[async_trait]
@@ -61,10 +61,10 @@ impl EventHandler for Handler {
             let awaiting_details = self.awaiting_details.lock().await;
             if *awaiting_details {
                 let attachments = message.attachments.get(0).unwrap();
+                let mut contest_guard = self.contest.lock().await;
                 if let Some(t) = attachments.content_type.as_ref() {
                     if t == "application/json; charset=utf-8" {
                         if let Ok(data) = attachments.download().await {
-                            let mut contest_guard = self.contest.lock().await;
                             if let Ok(details) = serde_json::from_slice(data.as_slice()) {
                                 if let Some(contest) = contest_guard.as_mut() {
                                     contest.details = details;
@@ -101,19 +101,17 @@ impl EventHandler for Handler {
                                                         if let Err(why) = broadcast {
                                                             println!("Error sending message: {:?}", why);
                                                         }
-                                                    } else {
-                                                        if let Some(last_day) = c.details.get_last_day() {
-                                                            if *d > last_day {
-                                                                *contest = None;
-                                                                let broadcast = ChannelId(950395373183197234)
-                                                                    .send_message(&ctx.http, |m| {
-                                                                        m.content("The current contest has ended!")
-                                                                    }).await;
-                                                                if let Err(why) = broadcast {
-                                                                    println!("Error sending message: {:?}", why);
-                                                                }
-                                                                break;
+                                                    } else if let Some(last_day) = c.details.get_last_day() {
+                                                        if *d > last_day {
+                                                            *contest = None;
+                                                            let broadcast = ChannelId(950395373183197234)
+                                                                .send_message(&ctx.http, |m| {
+                                                                    m.content("The current contest has ended!")
+                                                                }).await;
+                                                            if let Err(why) = broadcast {
+                                                                println!("Error sending message: {:?}", why);
                                                             }
+                                                            break;
                                                         }
                                                     }
                                                 }
@@ -129,8 +127,14 @@ impl EventHandler for Handler {
                                 }).await {
                                     println!("An error occurred confirming contest details: {:?}", why);
                                 }
-                                *contest_guard = None;
                             }
+                        } else {
+                            if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
+                                m.content("Failed to download attachment. Please restart the process with /contest start")
+                            }).await {
+                                println!("An error occurred confirming contest details: {:?}", why);
+                            }
+                            *contest_guard = None;
                         }
                     }
                 }
@@ -143,9 +147,13 @@ impl EventHandler for Handler {
         let register_commands = self.register_commands.lock().await;
         if *register_commands {
             let command = ApplicationCommand::create_global_application_command(&ctx.http, |c| {
-                c.name("contest").description("Base command for contest bot").create_option(|o| {
-                    o.name("start").description("Start a contest with a given json").kind(ApplicationCommandOptionType::SubCommand)
-                })
+                c.name("contest").description("Base command for contest bot")
+                    .create_option(|o| {
+                        o.name("start").description("Start a contest with a given json").kind(ApplicationCommandOptionType::SubCommand)
+                    })
+                    .create_option(|o| {
+                        o.name("stop").description("Stop the current contest").kind(ApplicationCommandOptionType::SubCommand)
+                    })
             }).await;
             println!("Created the following application command: {:#?}", command);
         }
@@ -163,10 +171,10 @@ impl EventHandler for Handler {
                                 if let None = contest_guard.as_ref() {
                                     *contest_guard = Some(Contest {
                                         current_day: None,
-                                        details: ContestDetails(Vec::new())
+                                        details: ContestDetails(Vec::new()),
                                     });
                                     if let Err(why) = command
-                                        .create_interaction_response(&ctx.http, |r|  {
+                                        .create_interaction_response(&ctx.http, |r| {
                                             r.kind(InteractionResponseType::ChannelMessageWithSource)
                                                 .interaction_response_data(|m| m.content("Awaiting json with giveaway details."))
                                         }).await {
@@ -175,8 +183,23 @@ impl EventHandler for Handler {
                                     let mut awaiting_details = self.awaiting_details.lock().await;
                                     *awaiting_details = true;
                                 }
-                            },
-                            _ => { }
+                            }
+                            "stop" => {
+                                let mut contest_guard = self.contest.lock().await;
+                                if !contest_guard.as_ref().is_none() {
+                                    *contest_guard = None;
+                                }
+                                if let Err(why) = command
+                                    .create_interaction_response(&ctx.http, |r| {
+                                        r.kind(InteractionResponseType::ChannelMessageWithSource)
+                                            .interaction_response_data(|m| m.content("The giveaway has been stopped."))
+                                    }).await {
+                                    println!("Cannot respond to slash command: {}", why);
+                                }
+                                let mut awaiting_details = self.awaiting_details.lock().await;
+                                *awaiting_details = false;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -198,7 +221,7 @@ async fn main() {
     let handler = Handler {
         awaiting_details: Arc::new(Mutex::new(false)),
         register_commands: Arc::new(Mutex::new(register_slash_commands)),
-        contest: Arc::new(Mutex::new(Option::None))
+        contest: Arc::new(Mutex::new(Option::None)),
     };
 
     let mut client = Client::builder(token)
