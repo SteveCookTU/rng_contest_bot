@@ -35,7 +35,7 @@ struct ContestDetails(Vec<ContestDay>);
 
 impl ContestDetails {
     pub fn get_day(&self, day: u8) -> Option<&ContestDay> {
-        self.0.iter().filter(|d| d.day == day).next()
+        self.0.iter().find(|d| d.day == day)
     }
 
     pub fn get_last_day(&self) -> Option<u8> {
@@ -57,7 +57,7 @@ struct Handler {
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, message: Message) {
-        if message.attachments.len() > 0 {
+        if !message.attachments.is_empty() {
             let awaiting_details = self.awaiting_details.lock().await;
             if *awaiting_details {
                 let attachments = message.attachments.get(0).unwrap();
@@ -88,7 +88,7 @@ impl EventHandler for Handler {
                                             if let Some(c) = contest.as_mut() {
                                                 if let Some(d) = c.current_day.as_mut() {
                                                     *d += 1;
-                                                    if let Some(contest_day) = c.details.get_day(d.clone()) {
+                                                    if let Some(contest_day) = c.details.get_day(*d) {
                                                         let broadcast = ChannelId(950395373183197234)
                                                             .send_message(&ctx.http, |m| {
                                                                 m.embed(|e| {
@@ -121,12 +121,10 @@ impl EventHandler for Handler {
                                         }
                                     });
                                 }
-                            } else {
-                                if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
-                                    m.content("Failed to load contest details. Please restart the process with /contest start")
-                                }).await {
-                                    println!("An error occurred confirming contest details: {:?}", why);
-                                }
+                            } else if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
+                                m.content("Failed to load contest details. Please restart the process with /contest start")
+                            }).await {
+                                println!("An error occurred confirming contest details: {:?}", why);
                             }
                         } else {
                             if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
@@ -161,49 +159,46 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::ApplicationCommand(command) = interaction {
-            match command.data.name.as_str() {
-                "contest" => {
-                    let option = command.data.options.get(0).expect("Expected sub command option");
-                    if let ApplicationCommandOptionType::SubCommand = option.kind {
-                        match option.name.as_str() {
-                            "start" => {
-                                let mut contest_guard = self.contest.lock().await;
-                                if let None = contest_guard.as_ref() {
-                                    *contest_guard = Some(Contest {
-                                        current_day: None,
-                                        details: ContestDetails(Vec::new()),
-                                    });
-                                    if let Err(why) = command
-                                        .create_interaction_response(&ctx.http, |r| {
-                                            r.kind(InteractionResponseType::ChannelMessageWithSource)
-                                                .interaction_response_data(|m| m.content("Awaiting json with giveaway details."))
-                                        }).await {
-                                        println!("Cannot respond to slash command: {}", why);
-                                    }
-                                    let mut awaiting_details = self.awaiting_details.lock().await;
-                                    *awaiting_details = true;
-                                }
-                            }
-                            "stop" => {
-                                let mut contest_guard = self.contest.lock().await;
-                                if !contest_guard.as_ref().is_none() {
-                                    *contest_guard = None;
-                                }
+            if command.data.name.as_str() == "contest" {
+                let option = command.data.options.get(0).expect("Expected sub command option");
+                if let ApplicationCommandOptionType::SubCommand = option.kind {
+                    match option.name.as_str() {
+                        "start" => {
+                            let mut contest_guard = self.contest.lock().await;
+                            if contest_guard.as_ref().is_none() {
+                                *contest_guard = Some(Contest {
+                                    current_day: None,
+                                    details: ContestDetails(Vec::new()),
+                                });
                                 if let Err(why) = command
                                     .create_interaction_response(&ctx.http, |r| {
                                         r.kind(InteractionResponseType::ChannelMessageWithSource)
-                                            .interaction_response_data(|m| m.content("The giveaway has been stopped."))
+                                            .interaction_response_data(|m| m.content("Awaiting json with giveaway details."))
                                     }).await {
                                     println!("Cannot respond to slash command: {}", why);
                                 }
                                 let mut awaiting_details = self.awaiting_details.lock().await;
-                                *awaiting_details = false;
+                                *awaiting_details = true;
                             }
-                            _ => {}
                         }
+                        "stop" => {
+                            let mut contest_guard = self.contest.lock().await;
+                            if contest_guard.as_ref().is_some() {
+                                *contest_guard = None;
+                            }
+                            if let Err(why) = command
+                                .create_interaction_response(&ctx.http, |r| {
+                                    r.kind(InteractionResponseType::ChannelMessageWithSource)
+                                        .interaction_response_data(|m| m.content("The giveaway has been stopped."))
+                                }).await {
+                                println!("Cannot respond to slash command: {}", why);
+                            }
+                            let mut awaiting_details = self.awaiting_details.lock().await;
+                            *awaiting_details = false;
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -212,7 +207,7 @@ impl EventHandler for Handler {
 #[tokio::main]
 async fn main() {
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
-    let register_slash_commands = env::var("REGISTER_COMMANDS").unwrap_or("false".to_owned()).parse::<bool>().unwrap_or(false);
+    let register_slash_commands = env::var("REGISTER_COMMANDS").unwrap_or_else(|_| "false".to_owned()).parse::<bool>().unwrap_or(false);
     let application_id: u64 = env::var("APPLICATION_ID")
         .expect("Expected an application id in the environment")
         .parse()
