@@ -1,24 +1,24 @@
-use std::env;
-use std::sync::Arc;
-use std::time::Duration;
+use serenity::model::interactions::application_command::ApplicationCommandOptionType;
+use serenity::model::interactions::{Interaction, InteractionResponseType};
+use serenity::model::prelude::application_command::ApplicationCommand;
 use serenity::{
-    client::bridge::gateway::GatewayIntents,
     async_trait,
     model::{channel::Message, gateway::Ready},
     prelude::*,
 };
-use serenity::model::interactions::application_command::ApplicationCommandOptionType;
-use serenity::model::interactions::{Interaction, InteractionResponseType};
-use serenity::model::prelude::application_command::{ApplicationCommand};
+use std::collections::HashMap;
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::time;
 
 use serde::Deserialize;
 use serenity::http::CacheHttp;
-use serenity::model::id::RoleId;
+use serenity::model::id::{RoleId, UserId};
 use serenity::model::prelude::{ChannelId, InteractionApplicationCommandCallbackDataFlags};
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize)]
 struct ContestDay {
     day: u8,
     species: u8,
@@ -28,11 +28,21 @@ struct ContestDay {
 
 impl ContestDay {
     pub fn hints_to_fields(&self) -> Vec<(String, String, bool)> {
-        self.hints.iter().enumerate().map(|(i, s)| ("Hint ".to_owned() + (i + 1).to_string().as_str(), s.to_owned(), true)).collect::<Vec<(String, String, bool)>>()
+        self.hints
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    "Hint ".to_owned() + (i + 1).to_string().as_str(),
+                    s.to_owned(),
+                    true,
+                )
+            })
+            .collect::<Vec<(String, String, bool)>>()
     }
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize)]
 struct ContestDetails(Vec<ContestDay>);
 
 impl ContestDetails {
@@ -48,6 +58,19 @@ impl ContestDetails {
 struct Contest {
     current_day: Option<u8>,
     details: ContestDetails,
+    leaderboard: HashMap<u64, u64>,
+}
+
+impl Contest {
+    pub fn get_top_five(&self) -> Vec<(u64, u64)> {
+        let mut leaderboard: Vec<_> = self.leaderboard.iter().collect();
+        leaderboard.sort_by(|a, b| a.1.cmp(b.1));
+        leaderboard
+            .iter()
+            .take(5)
+            .map(|&a| (*a.0, *a.1))
+            .collect::<Vec<(u64, u64)>>()
+    }
 }
 
 struct Handler {
@@ -63,13 +86,23 @@ impl EventHandler for Handler {
     async fn message(&self, ctx: Context, message: Message) {
         if !message.attachments.is_empty() {
             let awaiting_details = self.awaiting_details.lock().await;
-            if *awaiting_details && message.author.has_role(&ctx.http(), message.guild_id.unwrap(), RoleId(self.permission_role)).await.expect("Failed to retrieve role") {
-                    let attachments = message.attachments.get(0).unwrap();
-                    let mut contest_guard = self.contest.lock().await;
-                    if let Some(t) = attachments.content_type.as_ref() {
-                        if t == "application/json; charset=utf-8" {
-                            if let Ok(data) = attachments.download().await {
-                                if let Ok(details) = serde_json::from_slice(data.as_slice()) {
+            if *awaiting_details
+                && message
+                    .author
+                    .has_role(
+                        &ctx.http(),
+                        message.guild_id.unwrap(),
+                        RoleId(self.permission_role),
+                    )
+                    .await
+                    .expect("Failed to retrieve role")
+            {
+                let attachments = message.attachments.get(0).unwrap();
+                let mut contest_guard = self.contest.lock().await;
+                if let Some(t) = attachments.content_type.as_ref() {
+                    if t == "application/json; charset=utf-8" {
+                        if let Ok(data) = attachments.download().await {
+                            if let Ok(details) = serde_json::from_slice(data.as_slice()) {
                                     if let Some(contest) = contest_guard.as_mut() {
                                         contest.details = details;
                                         if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
@@ -107,10 +140,19 @@ impl EventHandler for Handler {
                                                             }
                                                         } else if let Some(last_day) = c.details.get_last_day() {
                                                             if *d > last_day {
+                                                                let top_five = contest.as_ref().unwrap().get_top_five();
+                                                                let mut field = String::new();
+                                                                for score in top_five {
+                                                                    let user_nick = UserId(score.0).to_user(&ctx.http).await.unwrap().name;
+                                                                    field = field + user_nick.as_str() + ": " + score.1.to_string().as_str();
+                                                                }
                                                                 *contest = None;
                                                                 let broadcast = ChannelId(channel_id)
                                                                     .send_message(&ctx.http, |m| {
-                                                                        m.content("The current contest has ended!")
+                                                                        m.content("The current contest has ended!").embed(|e| {
+                                                                            e.title("Final Standings");
+                                                                            e.field("", field, false)
+                                                                        })
                                                                     }).await;
                                                                 if let Err(why) = broadcast {
                                                                     println!("Error sending message: {:?}", why);
@@ -130,18 +172,17 @@ impl EventHandler for Handler {
                                 }).await {
                                     println!("An error occurred confirming contest details: {:?}", why);
                                 }
-                            } else {
-                                if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
+                        } else {
+                            if let Err(why) = message.channel_id.send_message(&ctx.http, |m| {
                                     m.content("Failed to download attachment. Please restart the process with /contest start")
                                 }).await {
                                     println!("An error occurred confirming contest details: {:?}", why);
                                 }
-                                *contest_guard = None;
-                            }
+                            *contest_guard = None;
                         }
                     }
                 }
-
+            }
         }
     }
 
@@ -150,30 +191,55 @@ impl EventHandler for Handler {
         let register_commands = self.register_commands.lock().await;
         if *register_commands {
             let command = ApplicationCommand::create_global_application_command(&ctx.http, |c| {
-                c.name("contest").description("Base command for contest bot")
+                c.name("contest")
+                    .description("Base command for contest bot")
                     .create_option(|o| {
-                        o.name("start").description("Start a contest with a given json").kind(ApplicationCommandOptionType::SubCommand)
+                        o.name("start")
+                            .description("Start a contest with a given json")
+                            .kind(ApplicationCommandOptionType::SubCommand)
                     })
                     .create_option(|o| {
-                        o.name("stop").description("Stop the current contest").kind(ApplicationCommandOptionType::SubCommand)
+                        o.name("stop")
+                            .description("Stop the current contest")
+                            .kind(ApplicationCommandOptionType::SubCommand)
                     })
-            }).await;
+                    .create_option(|o| {
+                        o.name("leaderboard")
+                            .description("Displays the leaderboard for the current running contest")
+                            .kind(ApplicationCommandOptionType::SubCommand)
+                    })
+            })
+            .await;
             println!("Created the following application command: {:#?}", command);
         }
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         if let Interaction::ApplicationCommand(command) = interaction {
-            if command.data.name.as_str() == "contest" && command.user.has_role(&ctx.http(), command.guild_id.unwrap(), RoleId(self.permission_role)).await.expect("Failed to retrieve role") {
-                let option = command.data.options.get(0).expect("Expected sub command option");
+            if command.data.name.as_str() == "contest" {
+                let option = command
+                    .data
+                    .options
+                    .get(0)
+                    .expect("Expected sub command option");
                 if let ApplicationCommandOptionType::SubCommand = option.kind {
+                    let has_permission = command
+                        .user
+                        .has_role(
+                            &ctx.http(),
+                            command.guild_id.unwrap(),
+                            RoleId(self.permission_role),
+                        )
+                        .await
+                        .expect("Failed to retrieve role");
                     match option.name.as_str() {
-                        "start" => {
+                        "start" if has_permission => {
                             let mut contest_guard = self.contest.lock().await;
                             if contest_guard.as_ref().is_none() {
                                 *contest_guard = Some(Contest {
                                     current_day: None,
                                     details: ContestDetails(Vec::new()),
+                                    leaderboard: HashMap::new()
                                 });
                                 if let Err(why) = command
                                     .create_interaction_response(&ctx.http, |r| {
@@ -186,7 +252,7 @@ impl EventHandler for Handler {
                                 *awaiting_details = true;
                             }
                         }
-                        "stop" => {
+                        "stop" if has_permission => {
                             let mut contest_guard = self.contest.lock().await;
                             if contest_guard.as_ref().is_some() {
                                 *contest_guard = None;
@@ -201,7 +267,46 @@ impl EventHandler for Handler {
                             let mut awaiting_details = self.awaiting_details.lock().await;
                             *awaiting_details = false;
                         }
-                        _ => {}
+                        "leaderboard" => {
+                            let contest_guard = self.contest.lock().await;
+                            if contest_guard.as_ref().is_none() {
+                                if let Err(why) = command
+                                    .create_interaction_response(&ctx.http, |r| {
+                                        r.kind(InteractionResponseType::ChannelMessageWithSource)
+                                            .interaction_response_data(|m| m.flags(InteractionApplicationCommandCallbackDataFlags::EPHEMERAL).content("There is no contest running."))
+                                    }).await {
+                                    println!("Cannot respond to slash command: {}", why);
+                                }
+                            } else {
+                                let top_five = contest_guard.as_ref().unwrap().get_top_five();
+                                let mut field = String::new();
+                                for score in top_five {
+                                    let user_nick = UserId(score.0).to_user(&ctx.http).await.unwrap().nick_in(&ctx.http, command.guild_id.unwrap()).await.unwrap();
+                                    field = field + user_nick.as_str() + ": " + score.1.to_string().as_str();
+                                }
+                                if let Err(why) = command
+                                    .create_interaction_response(&ctx.http, |r| {
+                                        r.kind(InteractionResponseType::ChannelMessageWithSource)
+                                            .interaction_response_data(|m| {
+                                                m.flags(InteractionApplicationCommandCallbackDataFlags::EPHEMERAL).embed(|e| {
+                                                    e.title("Current Standings");
+                                                    e.field("", field, false)
+                                                })
+                                            })
+                                    }).await {
+                                    println!("Cannot respond to slash command: {}", why);
+                                }
+                            }
+                        }
+                        _ => {
+                            if let Err(why) = command
+                                .create_interaction_response(&ctx.http, |r| {
+                                    r.kind(InteractionResponseType::ChannelMessageWithSource)
+                                        .interaction_response_data(|m| m.flags(InteractionApplicationCommandCallbackDataFlags::EPHEMERAL).content("You do not have permission to use this command."))
+                                }).await {
+                                println!("Cannot respond to slash command: {}", why);
+                            }
+                        }
                     }
                 }
             }
@@ -212,7 +317,10 @@ impl EventHandler for Handler {
 #[tokio::main]
 async fn main() {
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
-    let register_slash_commands = env::var("REGISTER_COMMANDS").unwrap_or_else(|_| "false".to_owned()).parse::<bool>().unwrap_or(false);
+    let register_slash_commands = env::var("REGISTER_COMMANDS")
+        .unwrap_or_else(|_| "false".to_owned())
+        .parse::<bool>()
+        .unwrap_or(false);
     let application_id: u64 = env::var("APPLICATION_ID")
         .expect("Expected an application id in the environment")
         .parse()
@@ -229,15 +337,14 @@ async fn main() {
     let handler = Handler {
         awaiting_details: Arc::new(Mutex::new(false)),
         register_commands: Arc::new(Mutex::new(register_slash_commands)),
-        contest: Arc::new(Mutex::new(Option::None)),
+        contest: Arc::new(Mutex::new(None)),
         permission_role,
         contest_channel,
     };
 
-    let mut client = Client::builder(token)
+    let mut client = Client::builder(token, GatewayIntents::GUILD_MESSAGES)
         .event_handler(handler)
         .application_id(application_id)
-        .intents(GatewayIntents::GUILD_MESSAGES)
         .await
         .expect("Error creating client");
 
@@ -245,4 +352,3 @@ async fn main() {
         println!("An error occurred while running the client: {:?}", why);
     }
 }
-
